@@ -46,18 +46,21 @@ streamlit run streamlit_app.py
 The local UI provides Overview, Data pipeline, Paper signals, and Execution lab.
 It is paper-only and does not place broker orders.
 
-### Universe metadata CSV
+### VN100 snapshot CSV
 
-The Market scanner requires a dated, sourced CSV. Use
-`config/universe_metadata.example.csv` as the schema template:
+The Market scanner is VN100-only and requires a dated, sourced constituent
+snapshot that is active on the warehouse's latest EOD session. Use
+`config/vn100_snapshot.example.csv` as the schema template:
 
 ```csv
-symbol,exchange,cluster,effective_from,source
-VNM,HOSE,C5_DEFENSIVE,2026-08-03,HOSE official review snapshot
+symbol,exchange,cluster,effective_from,effective_to,source
+VNM,HOSE,C5_DEFENSIVE,2026-08-03,,https://example.org/saved-vn100-review
 ```
 
-Do not fill this file with guessed membership or guessed clusters. The current
-scanner validates the file, but it does not prove that the source is official.
+Save the official/public constituent page or document before importing it and
+record its URL or archival location in `source`. Do not fill this file with
+guessed membership or guessed clusters. The scanner rejects a snapshot with no
+members active on the scan date or duplicate active symbols.
 
 Read the [Vietnamese proposal audit](docs/01-bao-cao-tham-dinh-de-xuat.md) and
 the [project management plan](docs/pmp/project-management-plan.md) before
