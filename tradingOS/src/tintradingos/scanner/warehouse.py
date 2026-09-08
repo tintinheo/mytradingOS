@@ -14,7 +14,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from tintradingos.domain.market_rules import Exchange
 from tintradingos.indicators.core import atr_wilder, relative_strength, rsi_wilder, sma
+from tintradingos.reference.market_data import evidence_issues
 from tintradingos.signals.engine import Cluster, Regime, Rejection, Signal, SignalEngine
 
 MIN_OBSERVATIONS = 280
@@ -60,6 +62,13 @@ def scan_warehouse(
             rejections.append(
                 Rejection(symbol, "G1", f"only {len(bars)} observations; need {MIN_OBSERVATIONS}")
             )
+            continue
+        session_date, exchange_value, *_ = bars[-1]
+        evidence_gaps = evidence_issues(
+            db_path, symbol=symbol, exchange=Exchange(exchange_value), session_date=session_date
+        )
+        if evidence_gaps:
+            rejections.append(Rejection(symbol, "DATA_MISSING", "; ".join(evidence_gaps)))
             continue
         features = _features(bars, reference)
         eligible_count += 1
