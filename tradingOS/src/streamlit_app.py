@@ -17,6 +17,15 @@ from tintradingos.ingest.pipeline import (
     run_price_pipeline,
 )
 from tintradingos.ingest.providers import Provider, ProviderError, provider_for
+from tintradingos.journal.sqlite import (
+    artifact_digest,
+    export_journal_csv,
+    export_journal_json,
+    list_proposals,
+    list_scans,
+    record_outcome,
+    record_scan,
+)
 from tintradingos.reference.vn100 import VN100SnapshotError, parse_vn100_snapshot_csv
 from tintradingos.scanner.warehouse import scan_warehouse
 from tintradingos.signals.engine import Regime
@@ -96,7 +105,7 @@ def sidebar() -> str:
         st.divider()
         view = st.radio(
             "Workspace",
-            ["Overview", "Data pipeline", "Market scanner", "Execution lab"],
+            ["Overview", "Data pipeline", "Market scanner", "EOD journal", "Execution lab"],
             label_visibility="collapsed",
         )
         st.divider()
@@ -279,7 +288,10 @@ def pipeline_page() -> None:
 
 
 def market_scanner_page() -> None:
-    page_header("VN100 market scanner", "Quét VN100 có nguồn theo ngày hiệu lực và ghi rõ mã bị loại ở từng gate.")
+    page_header(
+        "VN100 market scanner",
+        "Quét VN100 có nguồn theo ngày hiệu lực và ghi rõ mã bị loại ở từng gate.",
+    )
     st.markdown(
         "<div class='risk-card'><b>Không phải khuyến nghị đầu tư.</b><br>Đây là paper signal để kiểm thử pipeline và hành vi engine.</div>",
         unsafe_allow_html=True,
@@ -300,10 +312,16 @@ def market_scanner_page() -> None:
         help="Columns: symbol, exchange, cluster, effective_from, effective_to, source",
     )
     snapshot = None
+    snapshot_bytes = b""
+    snapshot_filename = ""
     if metadata_file is not None:
         try:
-            snapshot = parse_vn100_snapshot_csv(metadata_file.getvalue(), as_of=as_of)
-            st.success(f"Loaded {len(snapshot.symbols)} active VN100 symbols from {metadata_file.name}")
+            snapshot_bytes = metadata_file.getvalue()
+            snapshot_filename = metadata_file.name
+            snapshot = parse_vn100_snapshot_csv(snapshot_bytes, as_of=as_of)
+            st.success(
+                f"Loaded {len(snapshot.symbols)} active VN100 symbols from {metadata_file.name}"
+            )
             st.dataframe(
                 [
                     {
@@ -336,6 +354,29 @@ def market_scanner_page() -> None:
             regime=Regime(regime),
             as_of=as_of,
         )
+        artifacts = {
+            "warehouse": {
+                "database": str(DB_PATH.resolve()),
+                "basis": "RAW",
+                "data_session": as_of.isoformat(),
+                "ohlcv_query": "basis=RAW; trading_date<=data_session; universe=active VN100 snapshot",
+            },
+            "vn100_snapshot": {
+                "filename": snapshot_filename,
+                "sha256": artifact_digest(snapshot_bytes),
+                "active_sources": sorted(set(snapshot.source_by_symbol.values())),
+                "effective_session": as_of.isoformat(),
+            },
+        }
+        scan_id = record_scan(
+            DB_PATH,
+            report,
+            regime=Regime(regime),
+            regime_inputs={"selected_regime": regime, "nav_vnd": nav, "available_cash_vnd": cash},
+            vn100_snapshot_source="; ".join(sorted(set(snapshot.source_by_symbol.values()))),
+            source_artifacts=artifacts,
+        )
+        st.success(f"Paper scan journaled as #{scan_id}. No broker order was created.")
         st.caption(
             f"As of: {report.as_of or 'no data'} · universe: {report.universe_size} · eligible: {report.eligible_count}"
         )
@@ -359,6 +400,78 @@ def market_scanner_page() -> None:
                 hide_index=True,
                 use_container_width=True,
             )
+
+
+def journal_page() -> None:
+    page_header(
+        "EOD paper journal",
+        "Immutable scan provenance, candidate/rejection ledger and observed paper outcomes for walk-forward analysis.",
+    )
+    st.markdown(
+        "<div class='risk-card'><b>PAPER ONLY.</b><br>Journal entries document research observations only. "
+        "They never submit or route broker orders.</div>",
+        unsafe_allow_html=True,
+    )
+    scans = list_scans(DB_PATH)
+    proposals = list_proposals(DB_PATH)
+    left, right = st.columns(2)
+    with left:
+        st.metric("Journaled EOD scans", len(scans))
+    with right:
+        st.metric("Paper proposals", len(proposals))
+    if scans:
+        st.subheader("Scan audit trail")
+        st.dataframe(scans, hide_index=True, use_container_width=True)
+        st.download_button(
+            "Export walk-forward CSV", export_journal_csv(DB_PATH), "eod_journal.csv", "text/csv"
+        )
+        st.download_button(
+            "Export walk-forward JSON",
+            export_journal_json(DB_PATH),
+            "eod_journal.json",
+            "application/json",
+        )
+    else:
+        st.info("No journaled scans yet. Run a valid VN100 scan to create the first audit record.")
+    if not proposals:
+        return
+    st.subheader("Observed T+1 and exit outcomes")
+    st.caption(
+        "Record observed market outcomes against a paper proposal; values remain linked to its original scan session and artifacts."
+    )
+    labels = {
+        f"#{item['proposal_id']} · {item['symbol']} · session {item['data_session']}": item
+        for item in proposals
+    }
+    selected_label = st.selectbox("Paper proposal", list(labels))
+    selected = labels[selected_label]
+    with st.form("outcome_form"):
+        t1_status = st.selectbox(
+            "T+1 status", ["NOT_RECORDED", "FILLED", "NOT_FILLED", "GAP_BLOCKED"]
+        )
+        col1, col2, col3 = st.columns(3)
+        t1_open = col1.number_input("T+1 open (VND)", min_value=0, value=0, step=100)
+        t1_high = col2.number_input("T+1 high (VND)", min_value=0, value=0, step=100)
+        t1_low = col3.number_input("T+1 low (VND)", min_value=0, value=0, step=100)
+        exit_date = st.date_input("Exit date (optional)", value=None)
+        exit_price = st.number_input("Exit price (VND, optional)", min_value=0, value=0, step=100)
+        exit_reason = st.text_input("Exit reason")
+        notes = st.text_area("Research notes")
+        submitted = st.form_submit_button("Save paper outcome")
+    if submitted:
+        record_outcome(
+            DB_PATH,
+            int(selected["proposal_id"]),
+            t1_open_vnd=str(t1_open) if t1_open else None,
+            t1_high_vnd=str(t1_high) if t1_high else None,
+            t1_low_vnd=str(t1_low) if t1_low else None,
+            t1_status=None if t1_status == "NOT_RECORDED" else t1_status,
+            exit_date=exit_date,
+            exit_price_vnd=str(exit_price) if exit_price else None,
+            exit_reason=exit_reason or None,
+            notes=notes,
+        )
+        st.success("Paper outcome saved with original scan provenance.")
 
 
 def execution_page() -> None:
@@ -415,5 +528,7 @@ elif view == "Data pipeline":
     pipeline_page()
 elif view == "Market scanner":
     market_scanner_page()
+elif view == "EOD journal":
+    journal_page()
 else:
     execution_page()
