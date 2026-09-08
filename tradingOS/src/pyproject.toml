@@ -1,0 +1,38 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tin-trading-os"
+version = "0.1.0"
+description = "Personal, EOD-only research system for Vietnam equities"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<10",
+    "pytest-cov>=6,<7",
+    "ruff>=0.8,<1",
+]
+ui = [
+    "streamlit>=1.40,<2",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["tintradingos"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --strict-config"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"streamlit_app.py" = ["E501"]

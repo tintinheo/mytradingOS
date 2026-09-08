@@ -1,0 +1,458 @@
+from __future__ import annotations
+
+import csv
+import io
+import sqlite3
+from datetime import date, timedelta
+from decimal import Decimal
+from pathlib import Path
+
+import streamlit as st
+
+from tintradingos.backtest.execution import FillPolicy, simulate_limit_entry
+from tintradingos.domain.market_rules import Exchange, MarketPrice, PriceBasis
+from tintradingos.ingest.cafef import CafeFDataset
+from tintradingos.ingest.pipeline import (
+    DataQualityError,
+    download_cafef_zip,
+    persist_provider_bars,
+    run_price_pipeline,
+)
+from tintradingos.ingest.providers import Provider, ProviderError, provider_for
+from tintradingos.scanner.warehouse import scan_warehouse
+from tintradingos.signals.engine import Cluster, Regime
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+DB_PATH = PROJECT_ROOT / "data" / "market.sqlite"
+METADATA_HEADERS = {"symbol", "exchange", "cluster", "effective_from", "source"}
+
+st.set_page_config(
+    page_title="TinTradingOS",
+    page_icon="T",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+st.markdown(
+    """
+    <style>
+    @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
+    :root { --ink:#17211b; --muted:#68736b; --paper:#f4f6f1; --line:#d9e0d8; --green:#0e6b50; --lime:#c9e86b; --amber:#f4b942; --red:#c94b4b; }
+    .stApp { background:var(--paper); color:var(--ink); }
+    [data-testid="stSidebar"] { background:#17211b; }
+    [data-testid="stSidebar"] * { color:#eaf0e9 !important; }
+    h1,h2,h3,p,span,label { font-family:'Manrope', sans-serif; }
+    h1 { letter-spacing:-.03em; font-weight:800; }
+    .mono { font-family:'DM Mono', monospace; letter-spacing:0; }
+    .eyebrow { color:var(--green); font-size:.72rem; font-weight:800; letter-spacing:.12em; text-transform:uppercase; }
+    .hero { border-bottom:1px solid var(--line); padding:1rem 0 1.35rem; margin-bottom:1.4rem; }
+    .hero h1 { margin:.25rem 0 .3rem; font-size:2.35rem; }
+    .hero p { color:var(--muted); margin:0; max-width:720px; }
+    .status { display:inline-block; background:var(--lime); color:var(--ink); border-radius:999px; padding:.3rem .7rem; font-size:.72rem; font-weight:800; }
+    .panel { background:white; border:1px solid var(--line); border-radius:10px; padding:1rem 1.1rem; }
+    .panel-title { font-weight:800; margin-bottom:.35rem; }
+    .panel-subtitle { color:var(--muted); font-size:.86rem; margin-bottom:.9rem; }
+    .signal-card { background:#17211b; color:#eef5ed; border-radius:10px; padding:1rem 1.1rem; margin:.4rem 0; }
+    .signal-card .accent { color:var(--lime); }
+    .risk-card { border-left:4px solid var(--amber); background:#fffaf0; padding:.85rem 1rem; border-radius:6px; }
+    div[data-testid="stMetric"] { background:white; border:1px solid var(--line); border-radius:8px; padding:.7rem; }
+    .small-note { color:var(--muted); font-size:.78rem; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def format_vnd(value: Decimal | int | float | str) -> str:
+    return f"{Decimal(str(value)):,.0f} VND"
+
+
+def query_db(query: str, params: tuple = ()) -> list[tuple]:
+    if not DB_PATH.exists():
+        return []
+    connection = sqlite3.connect(DB_PATH)
+    try:
+        return connection.execute(query, params).fetchall()
+    finally:
+        connection.close()
+
+
+def db_summary() -> dict[str, object]:
+    rows = query_db(
+        """
+        SELECT COUNT(*), COUNT(DISTINCT symbol), MAX(trading_date), COUNT(DISTINCT exchange)
+        FROM ohlcv
+        """
+    )
+    if not rows or rows[0][0] is None:
+        return {"rows": 0, "symbols": 0, "latest": "No data", "exchanges": 0}
+    row = rows[0]
+    return {"rows": row[0], "symbols": row[1], "latest": row[2], "exchanges": row[3]}
+
+
+def parse_universe_metadata(
+    payload: bytes,
+) -> tuple[set[str], dict[str, Cluster], list[dict[str, str]]]:
+    """Validate a dated, sourced universe/cluster CSV before scanning."""
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("Metadata file must be UTF-8 CSV") from exc
+    reader = csv.DictReader(io.StringIO(text))
+    headers = set(reader.fieldnames or [])
+    missing = METADATA_HEADERS - headers
+    if missing:
+        raise ValueError(f"Missing metadata columns: {', '.join(sorted(missing))}")
+    symbols: set[str] = set()
+    clusters: dict[str, Cluster] = {}
+    records: list[dict[str, str]] = []
+    for line_number, row in enumerate(reader, start=2):
+        symbol = (row.get("symbol") or "").strip().upper()
+        exchange = (row.get("exchange") or "").strip().upper()
+        cluster_text = (row.get("cluster") or "").strip().upper()
+        effective_from = (row.get("effective_from") or "").strip()
+        source = (row.get("source") or "").strip()
+        if not symbol.isascii() or not symbol.isalnum():
+            raise ValueError(f"Line {line_number}: invalid symbol")
+        try:
+            Exchange(exchange)
+            cluster = Cluster(cluster_text)
+        except ValueError as exc:
+            raise ValueError(f"Line {line_number}: invalid exchange or cluster") from exc
+        if cluster is Cluster.EXCLUDED:
+            raise ValueError(f"Line {line_number}: EXCLUDED cannot be scanned")
+        try:
+            date.fromisoformat(effective_from)
+        except ValueError as exc:
+            raise ValueError(f"Line {line_number}: effective_from must be YYYY-MM-DD") from exc
+        if not source:
+            raise ValueError(f"Line {line_number}: source is required")
+        if symbol in symbols:
+            raise ValueError(f"Line {line_number}: duplicate symbol {symbol}")
+        symbols.add(symbol)
+        clusters[symbol] = cluster
+        records.append(
+            {
+                "symbol": symbol,
+                "exchange": exchange,
+                "cluster": cluster.value,
+                "effective_from": effective_from,
+                "source": source,
+            }
+        )
+    if not records:
+        raise ValueError("Metadata CSV has no rows")
+    return symbols, clusters, records
+
+
+def sidebar() -> str:
+    with st.sidebar:
+        st.markdown("<div class='eyebrow'>TinTradingOS / local desk</div>", unsafe_allow_html=True)
+        st.markdown("# Research cockpit")
+        st.caption("EOD-only · long-only · paper mode")
+        st.divider()
+        view = st.radio(
+            "Workspace",
+            ["Overview", "Data pipeline", "Market scanner", "Execution lab"],
+            label_visibility="collapsed",
+        )
+        st.divider()
+        st.markdown("<span class='status'>PAPER ONLY</span>", unsafe_allow_html=True)
+        st.caption("Không đặt lệnh thật. Các tham số chiến lược chưa hiệu chuẩn.")
+        st.caption("Nguồn dữ liệu: CafeF EOD · local SQLite")
+    return view
+
+
+def page_header(title: str, subtitle: str) -> None:
+    st.markdown(
+        f"<div class='hero'><div class='eyebrow'>TinTradingOS / local research</div>"
+        f"<h1>{title}</h1><p>{subtitle}</p></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def overview() -> None:
+    summary = db_summary()
+    page_header(
+        "Market desk", "Một cửa sổ gọn để biết dữ liệu đang ở đâu và paper engine đang làm gì."
+    )
+    cols = st.columns(4)
+    cols[0].metric("Rows in warehouse", f"{summary['rows']:,}")
+    cols[1].metric("Symbols", f"{summary['symbols']:,}")
+    cols[2].metric("Latest session", summary["latest"])
+    cols[3].metric("Exchanges", summary["exchanges"])
+    st.write("")
+    left, right = st.columns([1.25, 0.75])
+    with left:
+        st.markdown(
+            "<div class='panel'><div class='panel-title'>System posture</div>"
+            "<div class='panel-subtitle'>Các lớp đã bật trong phiên bản hiện tại.</div>",
+            unsafe_allow_html=True,
+        )
+        st.dataframe(
+            [
+                {"Module": "CafeF OHLCV pipeline", "Status": "READY", "Mode": "Local"},
+                {"Module": "Pure Python indicators", "Status": "READY", "Mode": "Local"},
+                {"Module": "PB_MA20 paper signal", "Status": "READY", "Mode": "Paper"},
+                {"Module": "CCNN order flow", "Status": "BLOCKED", "Mode": "Evidence missing"},
+                {"Module": "C3 momentum", "Status": "BLOCKED", "Mode": "Fail-closed"},
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.markdown("</div>", unsafe_allow_html=True)
+    with right:
+        st.markdown(
+            "<div class='risk-card'><b>Safety gate</b><br>Paper-only. Không có broker integration, không auto-trading và không dùng adjusted price làm giá đặt lệnh.</div>",
+            unsafe_allow_html=True,
+        )
+        st.write("")
+        st.markdown(
+            "<div class='panel'><div class='panel-title'>Next useful action</div>"
+            "<div class='panel-subtitle'>Tải phiên EOD mới nhất ở Data pipeline, sau đó xem paper candidate ở Paper signals.</div></div>",
+            unsafe_allow_html=True,
+        )
+
+
+def pipeline_page() -> None:
+    page_header("Data pipeline", "Tải, kiểm tra và lưu OHLCV CafeF vào warehouse local.")
+    st.markdown(
+        "<div class='risk-card'><b>Readiness:</b> Scanner chỉ có thể đánh giá mã sau khi warehouse có đủ lịch sử và universe/cluster metadata theo ngày hiệu lực.</div>",
+        unsafe_allow_html=True,
+    )
+    bootstrap_date = st.date_input(
+        "Bootstrap session", value=date.today() - timedelta(days=3), key="bootstrap_date"
+    )
+    if st.button("Bootstrap raw + adjusted full history", use_container_width=True):
+        with st.status("Bootstrapping CafeF history...", expanded=True) as status:
+            try:
+                for dataset, basis, label in (
+                    (CafeFDataset.PRICE_RAW, PriceBasis.RAW, "raw"),
+                    (CafeFDataset.PRICE_ADJUSTED, PriceBasis.ADJUSTED, "adjusted"),
+                ):
+                    payload = download_cafef_zip(dataset, bootstrap_date, full_history=True)
+                    report = run_price_pipeline(
+                        payload,
+                        dataset=dataset,
+                        basis=basis,
+                        db_path=DB_PATH,
+                        source_name=f"CafeF {label} Upto",
+                    )
+                    st.write(f"{label}: {report.rows:,} rows · {report.symbols:,} symbols")
+                status.update(label="Bootstrap completed", state="complete")
+            except Exception as exc:
+                status.update(label="Bootstrap rejected", state="error")
+                st.error(str(exc))
+    col1, col2, col3 = st.columns([1, 1, 1.2])
+    with col1:
+        trading_date = st.date_input("Trading date", value=date.today() - timedelta(days=3))
+    with col2:
+        dataset_label = st.selectbox("Dataset", ["Raw price", "Adjusted price"])
+    with col3:
+        full_history = st.checkbox("Upto / full history", value=False)
+    basis = PriceBasis.RAW if dataset_label == "Raw price" else PriceBasis.ADJUSTED
+    dataset = CafeFDataset.PRICE_RAW if basis is PriceBasis.RAW else CafeFDataset.PRICE_ADJUSTED
+    if st.button("Run CafeF pipeline", type="primary", use_container_width=True):
+        with st.status("Downloading and validating...", expanded=True) as status:
+            try:
+                payload = download_cafef_zip(dataset, trading_date, full_history=full_history)
+                st.write(f"Downloaded `{len(payload):,}` bytes")
+                report = run_price_pipeline(
+                    payload,
+                    dataset=dataset,
+                    basis=basis,
+                    db_path=DB_PATH,
+                    source_name=f"CafeF {dataset_label}",
+                )
+                status.update(label="Pipeline completed", state="complete")
+                st.success(
+                    f"{report.rows:,} rows · {report.symbols:,} symbols · {report.trading_dates}"
+                )
+            except DataQualityError as exc:
+                status.update(label="Pipeline rejected", state="error")
+                st.error(str(exc))
+            except Exception as exc:
+                status.update(label="Unexpected failure", state="error")
+                st.exception(exc)
+    summary = db_summary()
+    st.markdown(
+        "<div class='panel'><div class='panel-title'>Warehouse snapshot</div></div>",
+        unsafe_allow_html=True,
+    )
+    st.write(f"Latest stored session: **{summary['latest']}** · Database: `{DB_PATH}`")
+    rows = query_db(
+        "SELECT exchange, basis, COUNT(*) FROM ohlcv GROUP BY exchange, basis ORDER BY exchange, basis"
+    )
+    if rows:
+        st.dataframe(
+            [{"Exchange": row[0], "Basis": row[1], "Rows": row[2]} for row in rows],
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("Chưa có dữ liệu. Chạy pipeline ở trên.")
+
+    st.divider()
+    st.subheader("Direct provider check")
+    st.caption(
+        "Kiểm tra nguồn trực tiếp trước khi đưa dữ liệu vào warehouse. Không trộn nguồn tự động."
+    )
+    provider_name = st.selectbox("Provider", list(Provider), key="provider_name")
+    provider_symbol = st.text_input("Ticker", value="AAA", key="provider_symbol")
+    provider_start = st.date_input(
+        "Start", value=date.today() - timedelta(days=365), key="provider_start"
+    )
+    provider_end = st.date_input("End", value=date.today(), key="provider_end")
+    if st.button("Fetch direct OHLCV", key="fetch_direct_provider"):
+        try:
+            provider = provider_for(Provider(provider_name))
+            bars = provider.fetch(provider_symbol, provider_start, provider_end)
+            st.session_state["direct_provider_bars"] = bars
+            st.success(
+                f"{provider.provider.value}: {len(bars)} bars · capability={provider.capability.value}"
+            )
+            st.dataframe(
+                [
+                    {
+                        "Date": bar.trading_date,
+                        "Open": bar.open_vnd,
+                        "High": bar.high_vnd,
+                        "Low": bar.low_vnd,
+                        "Close": bar.close_vnd,
+                        "Volume": bar.volume,
+                        "Source": bar.source.value,
+                    }
+                    for bar in bars
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+        except ProviderError as exc:
+            st.warning(str(exc))
+    stored_bars = st.session_state.get("direct_provider_bars")
+    if stored_bars and st.button("Import fetched bars to warehouse", key="import_direct_provider"):
+        imported = persist_provider_bars(DB_PATH, stored_bars)
+        st.success(f"Imported {imported:,} bars into local warehouse.")
+
+
+def market_scanner_page() -> None:
+    page_header("Market scanner", "Quét universe được chỉ định và ghi rõ mã bị loại ở từng gate.")
+    st.markdown(
+        "<div class='risk-card'><b>Không phải khuyến nghị đầu tư.</b><br>Đây là paper signal để kiểm thử pipeline và hành vi engine.</div>",
+        unsafe_allow_html=True,
+    )
+    st.info(
+        "Upload snapshot universe/cluster có nguồn và ngày hiệu lực. Không tự gán VN100 hoặc cluster."
+    )
+    metadata_file = st.file_uploader(
+        "Universe metadata CSV",
+        type=["csv"],
+        help="Columns: symbol, exchange, cluster, effective_from, source",
+    )
+    metadata: tuple[set[str], dict[str, Cluster], list[dict[str, str]]] | None = None
+    if metadata_file is not None:
+        try:
+            metadata = parse_universe_metadata(metadata_file.getvalue())
+            st.success(f"Loaded {len(metadata[0])} symbols from {metadata_file.name}")
+            st.dataframe(metadata[2], hide_index=True, use_container_width=True)
+        except ValueError as exc:
+            st.error(str(exc))
+    regime = st.selectbox("Market regime", list(Regime), index=2)
+    nav = st.number_input("NAV (VND)", min_value=1_000_000, value=1_000_000_000, step=10_000_000)
+    cash = st.number_input(
+        "Available cash (VND)", min_value=1_000_000, value=500_000_000, step=10_000_000
+    )
+    if st.button("Scan warehouse", type="primary"):
+        if metadata is None:
+            st.error("Upload a valid metadata CSV before scanning.")
+            st.stop()
+        symbols, cluster_by_symbol, _ = metadata
+        report = scan_warehouse(
+            DB_PATH,
+            universe=symbols,
+            cluster_by_symbol=cluster_by_symbol,
+            nav=nav,
+            available_cash=cash,
+            regime=Regime(regime),
+        )
+        st.caption(
+            f"As of: {report.as_of or 'no data'} · universe: {report.universe_size} · eligible: {report.eligible_count}"
+        )
+        if report.signals:
+            for signal in report.signals:
+                st.markdown(
+                    f"<div class='signal-card'><div class='eyebrow accent'>PAPER TICKET · {signal.setup}</div>"
+                    f"<h2>{signal.symbol} <span class='accent'>{signal.cluster.value}</span></h2>"
+                    f"<div class='mono'>Entry {format_vnd(signal.entry)} · Qty {signal.quantity:,} · Stop {format_vnd(signal.exit_stop)}</div>"
+                    f"<div class='mono'>Target 1 {format_vnd(signal.target_1)} · Target 2 {format_vnd(signal.target_2)} · R:R {signal.risk_reward}</div></div>",
+                    unsafe_allow_html=True,
+                )
+        else:
+            st.warning("Không sinh tín hiệu. Xem rejection ledger bên dưới.")
+        if report.rejections:
+            st.dataframe(
+                [
+                    {"Symbol": item.symbol, "Gate": item.gate, "Reason": item.reason}
+                    for item in report.rejections
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+
+
+def execution_page() -> None:
+    page_header("Execution lab", "Mô phỏng LO T+1 với giá raw, gap gate và policy khớp minh bạch.")
+    left, right = st.columns(2)
+    with left:
+        close = st.number_input("Close T (VND)", value=61_200, step=100)
+        open_price = st.number_input("Open T+1 (VND)", value=61_400, step=100)
+        high = st.number_input("High T+1 (VND)", value=62_000, step=100)
+    with right:
+        low = st.number_input("Low T+1 (VND)", value=61_300, step=100)
+        ceiling = st.number_input("Ceiling T+1 (VND)", value=65_400, step=100)
+        premium = st.number_input(
+            "LO premium", value=0.005, min_value=0.0, max_value=0.99, format="%.3f"
+        )
+    policy = st.radio("Fill policy", list(FillPolicy), horizontal=True, index=1)
+    max_gap = st.number_input(
+        "Maximum overnight gap", value=0.02, min_value=0.0, max_value=0.99, format="%.3f"
+    )
+    if st.button("Simulate T+1 fill", type="primary", use_container_width=True):
+        try:
+            result = simulate_limit_entry(
+                signal_close=MarketPrice.raw(close),
+                next_open=MarketPrice.raw(open_price),
+                next_high=MarketPrice.raw(high),
+                next_low=MarketPrice.raw(low),
+                next_ceiling=MarketPrice.raw(ceiling),
+                exchange=Exchange.HOSE,
+                premium=premium,
+                max_gap=max_gap,
+                fill_policy=FillPolicy(policy),
+            )
+            if result.filled:
+                st.success(
+                    f"FILLED · {format_vnd(result.price_vnd)} · gap {result.overnight_gap:.2%}"
+                )
+            else:
+                st.warning(f"NOT FILLED · {result.reason} · gap {result.overnight_gap:.2%}")
+            st.json(
+                {
+                    "limit_price_vnd": str(result.limit_price_vnd),
+                    "reason": result.reason.value,
+                    "overnight_gap": str(result.overnight_gap),
+                }
+            )
+        except Exception as exc:
+            st.error(str(exc))
+
+
+view = sidebar()
+if view == "Overview":
+    overview()
+elif view == "Data pipeline":
+    pipeline_page()
+elif view == "Market scanner":
+    market_scanner_page()
+else:
+    execution_page()
