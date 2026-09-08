@@ -10,6 +10,7 @@ import streamlit as st
 from tintradingos.backtest.execution import FillPolicy, simulate_limit_entry
 from tintradingos.domain.market_rules import Exchange, MarketPrice, PriceBasis
 from tintradingos.ingest.cafef import CafeFDataset
+from tintradingos.ingest.index import IndexEODError, parse_vn_index_eod_csv, persist_index_eod
 from tintradingos.ingest.pipeline import (
     DataQualityError,
     download_cafef_zip,
@@ -28,7 +29,6 @@ from tintradingos.journal.sqlite import (
 )
 from tintradingos.reference.vn100 import VN100SnapshotError, parse_vn100_snapshot_csv
 from tintradingos.scanner.warehouse import scan_warehouse
-from tintradingos.signals.engine import Regime
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DB_PATH = PROJECT_ROOT / "data" / "market.sqlite"
@@ -245,6 +245,21 @@ def pipeline_page() -> None:
         st.info("Chưa có dữ liệu. Chạy pipeline ở trên.")
 
     st.divider()
+    st.subheader("VN-Index EOD history")
+    st.caption(
+        "Import the strict source-backed CSV contract separately from equity OHLCV. "
+        "Required columns: date, open, high, low, close, source_url."
+    )
+    index_file = st.file_uploader("VN-Index EOD CSV", type=["csv"])
+    if index_file is not None and st.button("Import VN-Index EOD", key="import_vnindex"):
+        try:
+            bars = parse_vn_index_eod_csv(index_file.getvalue(), source_name=index_file.name)
+            persist_index_eod(DB_PATH, bars)
+            st.success(f"Imported {len(bars):,} VN-Index EOD bars into separate index history.")
+        except IndexEODError as exc:
+            st.error(str(exc))
+
+    st.divider()
     st.subheader("Direct provider check")
     st.caption(
         "Kiểm tra nguồn trực tiếp trước khi đưa dữ liệu vào warehouse. Không trộn nguồn tự động."
@@ -316,9 +331,7 @@ def market_scanner_page() -> None:
     snapshot_filename = ""
     if metadata_file is not None:
         try:
-            snapshot_bytes = metadata_file.getvalue()
-            snapshot_filename = metadata_file.name
-            snapshot = parse_vn100_snapshot_csv(snapshot_bytes, as_of=as_of)
+            snapshot = parse_vn100_snapshot_csv(metadata_file.getvalue(), as_of=as_of)
             st.success(
                 f"Loaded {len(snapshot.symbols)} active VN100 symbols from {metadata_file.name}"
             )
@@ -336,7 +349,6 @@ def market_scanner_page() -> None:
             )
         except VN100SnapshotError as exc:
             st.error(str(exc))
-    regime = st.selectbox("Market regime", list(Regime), index=2)
     nav = st.number_input("NAV (VND)", min_value=1_000_000, value=1_000_000_000, step=10_000_000)
     cash = st.number_input(
         "Available cash (VND)", min_value=1_000_000, value=500_000_000, step=10_000_000
@@ -351,32 +363,41 @@ def market_scanner_page() -> None:
             cluster_by_symbol=snapshot.cluster_by_symbol,
             nav=nav,
             available_cash=cash,
-            regime=Regime(regime),
             as_of=as_of,
         )
-        artifacts = {
-            "warehouse": {
-                "database": str(DB_PATH.resolve()),
-                "basis": "RAW",
-                "data_session": as_of.isoformat(),
-                "ohlcv_query": "basis=RAW; trading_date<=data_session; universe=active VN100 snapshot",
-            },
-            "vn100_snapshot": {
-                "filename": snapshot_filename,
-                "sha256": artifact_digest(snapshot_bytes),
-                "active_sources": sorted(set(snapshot.source_by_symbol.values())),
-                "effective_session": as_of.isoformat(),
-            },
-        }
-        scan_id = record_scan(
-            DB_PATH,
-            report,
-            regime=Regime(regime),
-            regime_inputs={"selected_regime": regime, "nav_vnd": nav, "available_cash_vnd": cash},
-            vn100_snapshot_source="; ".join(sorted(set(snapshot.source_by_symbol.values()))),
-            source_artifacts=artifacts,
+        if report.regime is None or report.regime_inputs is None:
+            st.error(
+                "Automated market regime unavailable: insufficient VN-Index or VN100 breadth history."
+            )
+            if report.rejections:
+                st.dataframe(
+                    [
+                        {"Symbol": item.symbol, "Gate": item.gate, "Reason": item.reason}
+                        for item in report.rejections
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            return
+        inputs = report.regime_inputs
+        st.subheader(f"Calculated regime: {report.regime.value}")
+        st.caption(
+            f"Input session: {inputs.as_of.isoformat()} · active VN100 snapshot effective on this date"
         )
-        st.success(f"Paper scan journaled as #{scan_id}. No broker order was created.")
+        metric_columns = st.columns(5)
+        metric_columns[0].metric("VN-Index close", f"{inputs.vni['close']:.2f}")
+        metric_columns[1].metric(
+            "VN-Index MA50 / MA200", f"{inputs.vni['ma50']:.2f} / {inputs.vni['ma200']:.2f}"
+        )
+        metric_columns[2].metric("Equal-weight close", f"{inputs.equal_weight['close']:.2f}")
+        metric_columns[3].metric(
+            "Equal-weight MA50 / MA200",
+            f"{inputs.equal_weight['ma50']:.2f} / {inputs.equal_weight['ma200']:.2f}",
+        )
+        metric_columns[4].metric(
+            "Breadth",
+            f"{inputs.breadth['pct_above_ma50']:.1%} above MA50 · AD slope {inputs.breadth['ad_line_slope_10']:.2f}",
+        )
         st.caption(
             f"As of: {report.as_of or 'no data'} · universe: {report.universe_size} · eligible: {report.eligible_count}"
         )
