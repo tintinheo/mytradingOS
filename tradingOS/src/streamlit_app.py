@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import csv
-import io
 import sqlite3
 from datetime import date, timedelta
 from decimal import Decimal
@@ -19,12 +17,12 @@ from tintradingos.ingest.pipeline import (
     run_price_pipeline,
 )
 from tintradingos.ingest.providers import Provider, ProviderError, provider_for
+from tintradingos.reference.vn100 import VN100SnapshotError, parse_vn100_snapshot_csv
 from tintradingos.scanner.warehouse import scan_warehouse
-from tintradingos.signals.engine import Cluster, Regime
+from tintradingos.signals.engine import Regime
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 DB_PATH = PROJECT_ROOT / "data" / "market.sqlite"
-METADATA_HEADERS = {"symbol", "exchange", "cluster", "effective_from", "source"}
 
 st.set_page_config(
     page_title="TinTradingOS",
@@ -88,61 +86,6 @@ def db_summary() -> dict[str, object]:
         return {"rows": 0, "symbols": 0, "latest": "No data", "exchanges": 0}
     row = rows[0]
     return {"rows": row[0], "symbols": row[1], "latest": row[2], "exchanges": row[3]}
-
-
-def parse_universe_metadata(
-    payload: bytes,
-) -> tuple[set[str], dict[str, Cluster], list[dict[str, str]]]:
-    """Validate a dated, sourced universe/cluster CSV before scanning."""
-    try:
-        text = payload.decode("utf-8-sig")
-    except UnicodeDecodeError as exc:
-        raise ValueError("Metadata file must be UTF-8 CSV") from exc
-    reader = csv.DictReader(io.StringIO(text))
-    headers = set(reader.fieldnames or [])
-    missing = METADATA_HEADERS - headers
-    if missing:
-        raise ValueError(f"Missing metadata columns: {', '.join(sorted(missing))}")
-    symbols: set[str] = set()
-    clusters: dict[str, Cluster] = {}
-    records: list[dict[str, str]] = []
-    for line_number, row in enumerate(reader, start=2):
-        symbol = (row.get("symbol") or "").strip().upper()
-        exchange = (row.get("exchange") or "").strip().upper()
-        cluster_text = (row.get("cluster") or "").strip().upper()
-        effective_from = (row.get("effective_from") or "").strip()
-        source = (row.get("source") or "").strip()
-        if not symbol.isascii() or not symbol.isalnum():
-            raise ValueError(f"Line {line_number}: invalid symbol")
-        try:
-            Exchange(exchange)
-            cluster = Cluster(cluster_text)
-        except ValueError as exc:
-            raise ValueError(f"Line {line_number}: invalid exchange or cluster") from exc
-        if cluster is Cluster.EXCLUDED:
-            raise ValueError(f"Line {line_number}: EXCLUDED cannot be scanned")
-        try:
-            date.fromisoformat(effective_from)
-        except ValueError as exc:
-            raise ValueError(f"Line {line_number}: effective_from must be YYYY-MM-DD") from exc
-        if not source:
-            raise ValueError(f"Line {line_number}: source is required")
-        if symbol in symbols:
-            raise ValueError(f"Line {line_number}: duplicate symbol {symbol}")
-        symbols.add(symbol)
-        clusters[symbol] = cluster
-        records.append(
-            {
-                "symbol": symbol,
-                "exchange": exchange,
-                "cluster": cluster.value,
-                "effective_from": effective_from,
-                "source": source,
-            }
-        )
-    if not records:
-        raise ValueError("Metadata CSV has no rows")
-    return symbols, clusters, records
 
 
 def sidebar() -> str:
@@ -336,26 +279,44 @@ def pipeline_page() -> None:
 
 
 def market_scanner_page() -> None:
-    page_header("Market scanner", "Quét universe được chỉ định và ghi rõ mã bị loại ở từng gate.")
+    page_header("VN100 market scanner", "Quét VN100 có nguồn theo ngày hiệu lực và ghi rõ mã bị loại ở từng gate.")
     st.markdown(
         "<div class='risk-card'><b>Không phải khuyến nghị đầu tư.</b><br>Đây là paper signal để kiểm thử pipeline và hành vi engine.</div>",
         unsafe_allow_html=True,
     )
+    summary = db_summary()
+    latest = summary["latest"]
+    if latest == "No data":
+        st.warning("Chưa có dữ liệu RAW. Hãy chạy CafeF pipeline trước khi quét VN100.")
+        return
+    as_of = date.fromisoformat(str(latest))
     st.info(
-        "Upload snapshot universe/cluster có nguồn và ngày hiệu lực. Không tự gán VN100 hoặc cluster."
+        f"VN100 only · data session {as_of.isoformat()}. Upload snapshot VN100 có nguồn và ngày hiệu lực; "
+        "không tự suy đoán thành phần hoặc cluster."
     )
     metadata_file = st.file_uploader(
-        "Universe metadata CSV",
+        "VN100 snapshot CSV",
         type=["csv"],
-        help="Columns: symbol, exchange, cluster, effective_from, source",
+        help="Columns: symbol, exchange, cluster, effective_from, effective_to, source",
     )
-    metadata: tuple[set[str], dict[str, Cluster], list[dict[str, str]]] | None = None
+    snapshot = None
     if metadata_file is not None:
         try:
-            metadata = parse_universe_metadata(metadata_file.getvalue())
-            st.success(f"Loaded {len(metadata[0])} symbols from {metadata_file.name}")
-            st.dataframe(metadata[2], hide_index=True, use_container_width=True)
-        except ValueError as exc:
+            snapshot = parse_vn100_snapshot_csv(metadata_file.getvalue(), as_of=as_of)
+            st.success(f"Loaded {len(snapshot.symbols)} active VN100 symbols from {metadata_file.name}")
+            st.dataframe(
+                [
+                    {
+                        "Symbol": symbol,
+                        "Cluster": snapshot.cluster_by_symbol[symbol].value,
+                        "Source": snapshot.source_by_symbol[symbol],
+                    }
+                    for symbol in sorted(snapshot.symbols)
+                ],
+                hide_index=True,
+                use_container_width=True,
+            )
+        except VN100SnapshotError as exc:
             st.error(str(exc))
     regime = st.selectbox("Market regime", list(Regime), index=2)
     nav = st.number_input("NAV (VND)", min_value=1_000_000, value=1_000_000_000, step=10_000_000)
@@ -363,17 +324,17 @@ def market_scanner_page() -> None:
         "Available cash (VND)", min_value=1_000_000, value=500_000_000, step=10_000_000
     )
     if st.button("Scan warehouse", type="primary"):
-        if metadata is None:
-            st.error("Upload a valid metadata CSV before scanning.")
+        if snapshot is None:
+            st.error("Upload a valid, active VN100 snapshot before scanning.")
             st.stop()
-        symbols, cluster_by_symbol, _ = metadata
         report = scan_warehouse(
             DB_PATH,
-            universe=symbols,
-            cluster_by_symbol=cluster_by_symbol,
+            universe=set(snapshot.symbols),
+            cluster_by_symbol=snapshot.cluster_by_symbol,
             nav=nav,
             available_cash=cash,
             regime=Regime(regime),
+            as_of=as_of,
         )
         st.caption(
             f"As of: {report.as_of or 'no data'} · universe: {report.universe_size} · eligible: {report.eligible_count}"
