@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from pathlib import Path
 
 from tintradingos.domain.market_rules import Exchange, MarketPrice, PriceBasis, round_down_to_tick
+from tintradingos.reference.market_data import evidence_issues, load_reference_price
 
 CEILING_PROXIMITY_FACTOR = Decimal("0.995")
 
@@ -17,6 +20,8 @@ class FillReason(StrEnum):
     OPENED_AT_CEILING = "OPENED_AT_CEILING"
     LIMIT_TOO_CLOSE_TO_CEILING = "LIMIT_TOO_CLOSE_TO_CEILING"
     LIMIT_NOT_REACHED = "LIMIT_NOT_REACHED"
+    MISSING_CORPORATE_ACTION_EVIDENCE = "MISSING_CORPORATE_ACTION_EVIDENCE"
+    MISSING_REFERENCE_PRICE_EVIDENCE = "MISSING_REFERENCE_PRICE_EVIDENCE"
 
 
 class FillPolicy(StrEnum):
@@ -106,6 +111,52 @@ def simulate_limit_entry(
         limit_price,
         gap,
         FillReason.FILLED,
+    )
+
+
+def simulate_contract_limit_entry(
+    *,
+    db_path: str | Path,
+    symbol: str,
+    next_session: date,
+    signal_close: MarketPrice,
+    next_open: MarketPrice,
+    next_high: MarketPrice,
+    next_low: MarketPrice,
+    exchange: Exchange,
+    premium: Decimal | int | float | str,
+    max_gap: Decimal | int | float | str,
+    fill_policy: FillPolicy,
+) -> FillResult:
+    """Fail closed unless T+1 corporate-action and published price evidence exists.
+
+    The published ceiling is passed directly into the fill model; it is never
+    reconstructed from the prior close, which is unsafe on ex-action dates.
+    """
+    gaps = evidence_issues(db_path, symbol=symbol, exchange=exchange, session_date=next_session)
+    limit = round_down_to_tick(
+        signal_close.value_vnd * (Decimal(1) + _rate(premium, "premium")), exchange
+    )
+    gap = next_open.value_vnd / signal_close.value_vnd - Decimal(1)
+    if "corporate-action evidence missing" in gaps:
+        return FillResult(False, None, limit, gap, FillReason.MISSING_CORPORATE_ACTION_EVIDENCE)
+    if "reference-price evidence missing" in gaps:
+        return FillResult(False, None, limit, gap, FillReason.MISSING_REFERENCE_PRICE_EVIDENCE)
+    published = load_reference_price(
+        db_path, symbol=symbol, exchange=exchange, session_date=next_session
+    )
+    if published is None:  # defensive against a concurrent delete
+        return FillResult(False, None, limit, gap, FillReason.MISSING_REFERENCE_PRICE_EVIDENCE)
+    return simulate_limit_entry(
+        signal_close=signal_close,
+        next_open=next_open,
+        next_high=next_high,
+        next_low=next_low,
+        next_ceiling=MarketPrice.raw(published.ceiling_price_vnd),
+        exchange=exchange,
+        premium=premium,
+        max_gap=max_gap,
+        fill_policy=fill_policy,
     )
 
 

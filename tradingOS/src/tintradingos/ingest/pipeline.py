@@ -20,6 +20,7 @@ from pathlib import Path
 from tintradingos.domain.market_rules import Exchange, PriceBasis
 from tintradingos.ingest.cafef import CafeFDataset, PriceBar, build_url, parse_price_csv
 from tintradingos.ingest.providers import ProviderBar
+from tintradingos.reference.market_data import CONTRACT_SCHEMA
 
 
 class PipelineStatus(StrEnum):
@@ -172,6 +173,7 @@ def persist_bars(db_path: str | Path, bars: tuple[PriceBar, ...]) -> None:
     try:
         with connection:
             connection.executescript(SCHEMA)
+            connection.executescript(CONTRACT_SCHEMA)
             connection.executemany(
                 """
             INSERT INTO ohlcv
@@ -227,6 +229,7 @@ def persist_provider_bars(db_path: str | Path, bars: tuple[ProviderBar, ...]) ->
     try:
         with connection:
             connection.executescript(SCHEMA)
+            connection.executescript(CONTRACT_SCHEMA)
             connection.execute(
                 "INSERT INTO provider_runs VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
