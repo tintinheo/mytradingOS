@@ -16,6 +16,11 @@ def seed_db(path, count=280):
         )
         """
     )
+    connection.execute(
+        """CREATE TABLE index_eod (
+        index_code TEXT, trading_date TEXT, open TEXT, high TEXT, low TEXT,
+        close TEXT, source_url TEXT, PRIMARY KEY(index_code, trading_date))"""
+    )
     start = date(2025, 1, 1)
     for index in range(count):
         day = start + timedelta(days=index)
@@ -34,6 +39,19 @@ def seed_db(path, count=280):
                 1_000_000,
             ),
         )
+        index_close = 1_000 + index * 2
+        connection.execute(
+            "INSERT INTO index_eod VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "VNINDEX",
+                day.isoformat(),
+                str(index_close),
+                str(index_close),
+                str(index_close),
+                str(index_close),
+                "https://example.test/vnindex",
+            ),
+        )
     connection.commit()
     connection.close()
 
@@ -48,7 +66,6 @@ def test_scanner_rejects_missing_cluster_metadata(tmp_path):
         cluster_by_symbol={},
         nav=1_000_000_000,
         available_cash=500_000_000,
-        regime=Regime.UPTREND,
     )
 
     assert report.signals == ()
@@ -57,7 +74,7 @@ def test_scanner_rejects_missing_cluster_metadata(tmp_path):
 
 def test_scanner_requires_minimum_history(tmp_path):
     db = tmp_path / "market.sqlite"
-    seed_db(db, count=10)
+    seed_db(db, count=200)
 
     report = scan_warehouse(
         db,
@@ -65,24 +82,41 @@ def test_scanner_requires_minimum_history(tmp_path):
         cluster_by_symbol={"AAA": Cluster.C5_DEFENSIVE},
         nav=1_000_000_000,
         available_cash=500_000_000,
-        regime=Regime.UPTREND,
     )
 
     assert report.eligible_count == 0
     assert report.rejections[0].gate == "G1"
 
 
-def test_scanner_keeps_missing_metadata_rejection_separate_from_ranked_candidates(tmp_path):
+def test_scanner_computes_regime_and_breadth_from_separate_index_history(tmp_path):
     db = tmp_path / "market.sqlite"
     seed_db(db)
 
     report = scan_warehouse(
         db,
-        universe={"AAA", "BBB"},
+        universe={"AAA"},
         cluster_by_symbol={"AAA": Cluster.C5_DEFENSIVE},
         nav=1_000_000_000,
         available_cash=500_000_000,
-        regime=Regime.UPTREND,
     )
 
-    assert any(item.symbol == "BBB" and item.gate == "DATA_MISSING" for item in report.rejections)
+    assert report.regime is Regime.STRONG_UPTREND
+    assert report.regime_inputs is not None
+    assert report.regime_inputs.breadth["pct_above_ma50"] == 1
+    assert report.regime_inputs.breadth["ad_line_slope_10"] > 0
+
+
+def test_scanner_fails_closed_without_separate_index_history(tmp_path):
+    db = tmp_path / "market.sqlite"
+    seed_db(db, count=199)
+
+    report = scan_warehouse(
+        db,
+        universe={"AAA"},
+        cluster_by_symbol={"AAA": Cluster.C5_DEFENSIVE},
+        nav=1_000_000_000,
+        available_cash=500_000_000,
+    )
+
+    assert report.regime is None
+    assert report.rejections[0].gate == "MARKET_DATA"
