@@ -1,0 +1,2 @@
+export const canonical=value=>JSON.stringify(value,(_key,v)=>v&&typeof v==='object'&&!Array.isArray(v)?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b))):v);
+export async function sha256(value){const buffer=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(typeof value==='string'?value:canonical(value)));return Array.from(new Uint8Array(buffer),b=>b.toString(16).padStart(2,'0')).join('');}

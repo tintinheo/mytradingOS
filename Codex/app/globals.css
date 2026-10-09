@@ -1,0 +1,4 @@
+@import "tailwindcss";
+:root{--background:#0a1216;--foreground:#e7f0ee;--card:#111f23;--card-foreground:#e7f0ee;--popover:#182b30;--popover-foreground:#e7f0ee;--primary:#6dcba2;--primary-foreground:#0c2722;--secondary:#182b30;--secondary-foreground:#e7f0ee;--muted:#26383c;--muted-foreground:#91a9a9;--accent:#dfb574;--accent-foreground:#162322;--destructive:#f2a39a;--border:#304145;--input:#365258;--ring:#efbd70;--radius:.5rem}
+@media(prefers-color-scheme:dark){:root{--background:#0a1216;--foreground:#e7f0ee;--card:#111f23;--card-foreground:#e7f0ee;--primary:#6dcba2;--primary-foreground:#0c2722;--border:#304145;--ring:#efbd70}}
+html,body{margin:0;width:100%;height:100%;background:var(--background);color:var(--foreground)}.lab-frame{width:100%;height:100dvh}.lab-frame iframe{display:block;width:100%;height:100%;border:0;background:var(--background)}
